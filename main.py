@@ -2,6 +2,7 @@ import torch
 import hydra
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
+from torch.optim import lr_scheduler
 import random
 import numpy as np
 from src.models.evflownet import EVFlowNet
@@ -27,14 +28,28 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
 
-def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
+# def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
+#     '''
+#     end-point-error (ground truthと予測値の二乗誤差)を計算
+#     pred_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
+#     gt_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 正解のオプティカルフローデータ
+#     '''
+#     epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
+#     return epe
+
+def compute_epe_error(pred_flow_dict: dict, gt_flow: torch.Tensor):
     '''
     end-point-error (ground truthと予測値の二乗誤差)を計算
-    pred_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
+    pred_flow_dict: dict("flow(n)" : torch.Tensor), Tensor Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
     gt_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 正解のオプティカルフローデータ
     '''
-    epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
-    return epe
+    total_epe = 0
+    gamma = 0.8
+    for i in range(4):
+        pred_flow = pred_flow_dict[f"flow{i}"]
+        epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
+        total_epe += epe * (gamma ** (3-i))
+    return total_epe
 
 def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     '''
@@ -115,7 +130,9 @@ def main(args: DictConfig):
     # ------------------
     #   optimizer
     # ------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.train.initial_learning_rate)
+    scheduler = lr_scheduler.OneCycleLR(optimizer, max_lr=args.train.initial_learning_rate, epochs=args.train.epochs, steps_per_epoch=len(train_data), pct_start=0.2)
     # ------------------
     #   Start training
     # ------------------
@@ -127,12 +144,13 @@ def main(args: DictConfig):
             batch: Dict[str, Any]
             event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
             ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
-            print(f"batch {i} loss: {loss.item()}")
+            flow_dict = model(event_image) # [B, 2, 480, 640]
+            loss: torch.Tensor = compute_epe_error(flow_dict, ground_truth_flow)
+            # print(f"batch {i} loss: {loss.item()}")
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
         print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
@@ -158,7 +176,7 @@ def main(args: DictConfig):
             batch: Dict[str, Any]
             event_image = batch["event_volume"].to(device)
             batch_flow = model(event_image) # [1, 2, 480, 640]
-            flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
+            flow = torch.cat((flow, batch_flow["flow3"]), dim=0)  # [N, 2, 480, 640]
         print("test done")
     # ------------------
     #  save submission
